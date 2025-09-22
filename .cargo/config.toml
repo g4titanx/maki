@@ -1,0 +1,4 @@
+[alias]
+bb = "build --all --all-features --release"
+tt = "nextest run --release --all --no-fail-fast"
+cc = "clippy --all -- -D warnings"

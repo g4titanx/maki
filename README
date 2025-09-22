@@ -1,0 +1,3 @@
+Maki is a password based encryption system for mnemonic seed phrases and other short secrets.
+It derives a strong key from a user’s password via Argon2id, encrypts with authenticated encryption (AES-GCM or ChaCha20-Poly1305),
+and outputs a portable blob safe for public storage
