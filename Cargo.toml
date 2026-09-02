@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-aes-gcm = "0.10.3"
-compiler_builtins = "0.1.160"
-thiserror = "2.0.16"
+argon2 = { version = "0.6.0", features = ["parallel", "zeroize"] }
+base64ct = { version = "1.8.3", features = ["alloc"] }
+chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
+crossterm = "0.29.0"
+getrandom = "0.4.3"
+image = { version = "0.25.10", default-features = false, features = ["webp"] }
+ratatui = "0.30.2"
+zeroize = "1.9.0"

@@ -1,412 +1,578 @@
+//! Maki's cryptographic core.
+
 use std::fmt;
 
-#[derive(Debug, Clone, PartialEq)]
+use base64ct::{Base64UrlUnpadded, Encoding};
+use zeroize::Zeroizing;
+
+mod argon;
+mod xchacha;
+
+pub use argon::{
+    Argon2Settings, KEY_LENGTH, KeyDerivationError, SALT_LENGTH, derive_key, generate_salt,
+};
+pub use xchacha::{
+    EncryptionError, NONCE_LENGTH, TAG_LENGTH, decrypt_with_key, encrypt_with_key, generate_nonce,
+};
+
+use argon::{derive_key_with_settings, settings_are_safe};
+
+/// Recommended maximum size of a secret, in bytes.
+pub const DEFAULT_MAX_SECRET_SIZE: usize = 4 * 1024;
+
+/// Prefix identifying text produced by Maki.
+pub const TEXT_PREFIX: &str = "maki:";
+
+const MEMORY_END: usize = size_of::<u32>();
+const PASSES_END: usize = MEMORY_END + size_of::<u32>();
+const LANES_END: usize = PASSES_END + size_of::<u32>();
+const SALT_END: usize = LANES_END + SALT_LENGTH;
+const NONCE_END: usize = SALT_END + NONCE_LENGTH;
+const HEADER_LENGTH: usize = NONCE_END;
+
+/// Errors produced while requesting random bytes from the operating system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RandomnessError {
+    Unavailable,
+}
+
+impl fmt::Display for RandomnessError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("secure operating-system randomness is unavailable")
+    }
+}
+
+impl std::error::Error for RandomnessError {}
+
+/// Errors produced by Maki's complete protection and recovery workflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MakiError {
-    InvalidPassword,
-    CorruptedBlob,
-    UnsupportedVersion,
-    CryptoError,
-    InvalidInput,
+    EmptySecret,
+    EmptyPassword,
+    SecretTooLarge,
+    InvalidSecretLimit,
+    InvalidText,
+    UnsafeParameters,
+    RandomnessUnavailable,
+    KeyDerivationFailed,
+    EncryptionFailed,
+    AuthenticationFailed,
 }
 
 impl fmt::Display for MakiError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MakiError::InvalidPassword => write!(f, "Invalid password"),
-            MakiError::CorruptedBlob => write!(f, "Corrupted blob data"),
-            MakiError::UnsupportedVersion => write!(f, "Unsupported blob version"),
-            MakiError::CryptoError => write!(f, "Cryptographic operation failed"),
-            MakiError::InvalidInput => write!(f, "Invalid input parameters"),
+            Self::EmptySecret => formatter.write_str("secret cannot be empty"),
+            Self::EmptyPassword => formatter.write_str("password cannot be empty"),
+            Self::SecretTooLarge => formatter.write_str("secret exceeds the configured size limit"),
+            Self::InvalidSecretLimit => formatter.write_str("invalid secret size limit"),
+            Self::InvalidText => formatter.write_str("invalid Maki encrypted text"),
+            Self::UnsafeParameters => formatter.write_str("unsafe Argon2id parameters"),
+            Self::RandomnessUnavailable => {
+                formatter.write_str("secure operating-system randomness is unavailable")
+            }
+            Self::KeyDerivationFailed => formatter.write_str("Argon2id key derivation failed"),
+            Self::EncryptionFailed => formatter.write_str("encryption failed"),
+            Self::AuthenticationFailed => {
+                formatter.write_str("password is incorrect or encrypted content was changed")
+            }
         }
     }
 }
 
 impl std::error::Error for MakiError {}
 
-// Argon2 parameters
-#[derive(Debug, Clone, Copy)]
-pub struct Argon2Params {
-    pub memory_kb: u32,     // Memory cost in KB
-    pub iterations: u32,    // Time cost
-    pub parallelism: u32,   // Parallelism degree
+fn random_array<const N: usize>() -> Result<[u8; N], RandomnessError> {
+    let mut bytes = [0_u8; N];
+    getrandom::fill(&mut bytes).map_err(|_| RandomnessError::Unavailable)?;
+    Ok(bytes)
 }
 
-impl Default for Argon2Params {
-    fn default() -> Self {
-        Self {
-            memory_kb: 65536,   // 64 MiB
-            iterations: 1,
-            parallelism: 4,
-        }
-    }
+/// Protects a secret using Maki's recommended 4-KiB secret-size limit.
+///
+/// `password` is arbitrary binary data and has no Maki-imposed size limit.
+pub fn protect(secret: &[u8], password: &[u8]) -> Result<String, MakiError> {
+    protect_with_limit(secret, password, DEFAULT_MAX_SECRET_SIZE)
 }
 
-impl Argon2Params {
-    // Pack parameters into 3 bytes
-    // Format: [memory_high:8][memory_low:4|iter:4][para:8]
-    // Supports memory up to 16GB (24 bits), iter up to 15, para up to 255
-    pub fn pack(&self) -> [u8; 3] {
-        let mem = (self.memory_kb >> 10).min(0xFFFFFF); // Convert to MB, cap at 24-bit max
-        let iter = self.iterations.min(15);
-        let para = self.parallelism.min(255);
-        
-        [
-            (mem >> 4) as u8,
-            ((mem & 0xF) << 4 | iter) as u8,
-            para as u8,
-        ]
-    }
-    
-    pub fn unpack(bytes: [u8; 3]) -> Self {
-        let mem_mb = ((bytes[0] as u32) << 4) | ((bytes[1] as u32) >> 4);
-        let memory_kb = mem_mb << 10; // Convert back to KB
-        let iterations = (bytes[1] & 0xF) as u32;
-        let parallelism = bytes[2] as u32;
-        
-        Self { memory_kb, iterations, parallelism }
-    }
+/// Protects a secret using a caller-selected secret-size limit.
+///
+/// The result starts with [`TEXT_PREFIX`] and contains URL-safe Base64 without
+/// padding. A fresh salt and nonce are generated for every call.
+pub fn protect_with_limit(
+    secret: &[u8],
+    password: &[u8],
+    max_secret_size: usize,
+) -> Result<String, MakiError> {
+    validate_protection_input(secret, password, max_secret_size)?;
+    let salt = generate_salt().map_err(|_| MakiError::RandomnessUnavailable)?;
+    let nonce = generate_nonce().map_err(|_| MakiError::RandomnessUnavailable)?;
+
+    protect_with_settings_and_material(
+        secret,
+        password,
+        max_secret_size,
+        Argon2Settings::default(),
+        salt,
+        nonce,
+    )
 }
 
-// Encrypted blob structure
-#[derive(Debug, Clone)]
-pub struct EncryptedBlob {
-    pub version: u8,
-    pub params: Argon2Params,
-    pub salt: [u8; 16],
-    pub nonce: [u8; 12],
-    pub ciphertext: Vec<u8>, // Includes 16-byte auth tag
+/// Recovers a secret using Maki's recommended 4-KiB secret-size limit.
+pub fn recover(encrypted_text: &str, password: &[u8]) -> Result<Zeroizing<Vec<u8>>, MakiError> {
+    recover_with_limit(encrypted_text, password, DEFAULT_MAX_SECRET_SIZE)
 }
 
-impl EncryptedBlob {
-    const VERSION: u8 = 0x01;
-    const HEADER_SIZE: usize = 1 + 3 + 16 + 12; // version + params + salt + nonce
-    const TAG_SIZE: usize = 16;
-    
-    pub fn new(params: Argon2Params, salt: [u8; 16], nonce: [u8; 12], ciphertext: Vec<u8>) -> Self {
-        Self {
-            version: Self::VERSION,
-            params,
-            salt,
-            nonce,
-            ciphertext,
-        }
+/// Recovers a secret using a caller-selected secret-size limit.
+///
+/// `password` must contain the exact bytes supplied during protection. Text
+/// normalization, whitespace removal, and file conversion are not performed.
+pub fn recover_with_limit(
+    encrypted_text: &str,
+    password: &[u8],
+    max_secret_size: usize,
+) -> Result<Zeroizing<Vec<u8>>, MakiError> {
+    let max_text_length = maximum_text_length(max_secret_size)?;
+    if password.is_empty() {
+        return Err(MakiError::EmptyPassword);
     }
-    
-    // Serialize to bytes
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(Self::HEADER_SIZE + self.ciphertext.len());
-        
-        bytes.push(self.version);
-        bytes.extend_from_slice(&self.params.pack());
-        bytes.extend_from_slice(&self.salt);
-        bytes.extend_from_slice(&self.nonce);
-        bytes.extend_from_slice(&self.ciphertext);
-        
-        bytes
+    if encrypted_text.len() > max_text_length {
+        return Err(MakiError::SecretTooLarge);
     }
-    
-    // Deserialize from bytes
-    pub fn from_bytes(data: &[u8]) -> Result<Self, MakiError> {
-        if data.len() < Self::HEADER_SIZE + Self::TAG_SIZE {
-            return Err(MakiError::CorruptedBlob);
-        }
-        
-        let version = data[0];
-        if version != Self::VERSION {
-            return Err(MakiError::UnsupportedVersion);
-        }
-        
-        let params_bytes = [data[1], data[2], data[3]];
-        let params = Argon2Params::unpack(params_bytes);
-        
-        let mut salt = [0u8; 16];
-        salt.copy_from_slice(&data[4..20]);
-        
-        let mut nonce = [0u8; 12];
-        nonce.copy_from_slice(&data[20..32]);
-        
-        let ciphertext = data[32..].to_vec();
-        
-        Ok(Self::new(params, salt, nonce, ciphertext))
+
+    let encoded = encrypted_text
+        .strip_prefix(TEXT_PREFIX)
+        .ok_or(MakiError::InvalidText)?;
+    if encoded.is_empty() {
+        return Err(MakiError::InvalidText);
     }
-    
-    // Base64 encoding (URL-safe, no padding)
-    pub fn to_base64(&self) -> String {
-        base64_encode(&self.to_bytes())
+
+    let decoded = Base64UrlUnpadded::decode_vec(encoded).map_err(|_| MakiError::InvalidText)?;
+    let minimum_length = HEADER_LENGTH
+        .checked_add(TAG_LENGTH)
+        .and_then(|length| length.checked_add(1))
+        .ok_or(MakiError::InvalidSecretLimit)?;
+    if decoded.len() < minimum_length {
+        return Err(MakiError::InvalidText);
     }
-    
-    pub fn from_base64(s: &str) -> Result<Self, MakiError> {
-        let data = base64_decode(s).map_err(|_| MakiError::CorruptedBlob)?;
-        Self::from_bytes(&data)
+
+    let maximum_encrypted_length = max_secret_size
+        .checked_add(TAG_LENGTH)
+        .ok_or(MakiError::InvalidSecretLimit)?;
+    if decoded.len() - HEADER_LENGTH > maximum_encrypted_length {
+        return Err(MakiError::SecretTooLarge);
     }
+
+    let header = &decoded[..HEADER_LENGTH];
+    let encrypted_content = &decoded[HEADER_LENGTH..];
+    let settings = parse_settings(header)?;
+    validate_settings(settings)?;
+
+    let mut salt = [0_u8; SALT_LENGTH];
+    salt.copy_from_slice(&header[LANES_END..SALT_END]);
+    let mut nonce = [0_u8; NONCE_LENGTH];
+    nonce.copy_from_slice(&header[SALT_END..NONCE_END]);
+
+    let key = derive_key_with_settings(password, &salt, settings)
+        .map_err(|_| MakiError::KeyDerivationFailed)?;
+    let metadata = authenticated_metadata(header);
+
+    decrypt_with_key(encrypted_content, &key, &nonce, &metadata)
+        .map_err(|_| MakiError::AuthenticationFailed)
 }
 
-// Core cryptographic operations
-pub struct MakiCrypto;
+fn protect_with_settings_and_material(
+    secret: &[u8],
+    password: &[u8],
+    max_secret_size: usize,
+    settings: Argon2Settings,
+    salt: [u8; SALT_LENGTH],
+    nonce: [u8; NONCE_LENGTH],
+) -> Result<String, MakiError> {
+    validate_protection_input(secret, password, max_secret_size)?;
+    validate_settings(settings)?;
 
-impl MakiCrypto {
-    // Generate cryptographically secure random bytes
-    fn random_bytes<const N: usize>() -> [u8; N] {
-        let mut bytes = [0u8; N];
-        // In production, use a proper CSPRNG
-        // For now, placeholder - you'd use getrandom or similar
-        for i in 0..N {
-            bytes[i] = (std::ptr::addr_of!(bytes) as usize + i) as u8;
-        }
-        bytes
-    }
-    
-    // Derive key using Argon2id
-    fn derive_key(password: &[u8], salt: &[u8; 16], params: Argon2Params) -> Result<[u8; 32], MakiError> {
-        // Placeholder for Argon2id implementation
-        // In production: use argon2 crate or implement from scratch
-        let mut key = [0u8; 32];
-        
-        // Simple key stretching (NOT secure - replace with real Argon2id)
-        for i in 0..32 {
-            key[i] = password.iter()
-                .zip(salt.iter())
-                .enumerate()
-                .fold(0u8, |acc, (j, (p, s))| {
-                    acc.wrapping_add(*p)
-                        .wrapping_add(*s)
-                        .wrapping_add((i + j) as u8)
-                        .wrapping_add(params.iterations as u8)
-                });
-        }
-        
-        Ok(key)
-    }
-    
-    // AES-256-GCM encryption
-    fn aes_gcm_encrypt(key: &[u8; 32], nonce: &[u8; 12], plaintext: &[u8]) -> Result<Vec<u8>, MakiError> {
-        // Placeholder for AES-GCM implementation
-        // In production: use aes-gcm crate or implement from scratch
-        let mut ciphertext = vec![0u8; plaintext.len() + 16]; // +16 for auth tag
-        
-        // Simple XOR cipher (NOT secure - replace with real AES-GCM)
-        for (i, byte) in plaintext.iter().enumerate() {
-            let key_byte = key[i % 32];
-            let nonce_byte = nonce[i % 12];
-            ciphertext[i] = byte ^ key_byte ^ nonce_byte;
-        }
-        
-        // Fake auth tag (replace with real GMAC)
-        for i in 0..16 {
-            ciphertext[plaintext.len() + i] = key[i] ^ nonce[i % 12];
-        }
-        
-        Ok(ciphertext)
-    }
-    
-    // AES-256-GCM decryption
-    fn aes_gcm_decrypt(key: &[u8; 32], nonce: &[u8; 12], ciphertext: &[u8]) -> Result<Vec<u8>, MakiError> {
-        if ciphertext.len() < 16 {
-            return Err(MakiError::CorruptedBlob);
-        }
-        
-        let plaintext_len = ciphertext.len() - 16;
-        let (encrypted_data, auth_tag) = ciphertext.split_at(plaintext_len);
-        
-        // Verify auth tag (simplified - replace with real GMAC verification)
-        let expected_tag: Vec<u8> = (0..16).map(|i| key[i] ^ nonce[i % 12]).collect();
-        if auth_tag != expected_tag {
-            return Err(MakiError::InvalidPassword);
-        }
-        
-        // Decrypt (reverse of encryption)
-        let mut plaintext = vec![0u8; plaintext_len];
-        for (i, byte) in encrypted_data.iter().enumerate() {
-            let key_byte = key[i % 32];
-            let nonce_byte = nonce[i % 12];
-            plaintext[i] = byte ^ key_byte ^ nonce_byte;
-        }
-        
-        Ok(plaintext)
-    }
-    
-    // High-level encryption
-    pub fn encrypt(plaintext: &[u8], password: &str) -> Result<EncryptedBlob, MakiError> {
-        if plaintext.is_empty() || password.is_empty() {
-            return Err(MakiError::InvalidInput);
-        }
-        
-        let params = Argon2Params::default();
-        let salt = Self::random_bytes::<16>();
-        let nonce = Self::random_bytes::<12>();
-        
-        let password_bytes = password.as_bytes();
-        let key = Self::derive_key(password_bytes, &salt, params)?;
-        let ciphertext = Self::aes_gcm_encrypt(&key, &nonce, plaintext)?;
-        
-        // Zero out the key
-        // In production: use zeroize crate
-        
-        Ok(EncryptedBlob::new(params, salt, nonce, ciphertext))
-    }
-    
-    // High-level decryption
-    pub fn decrypt(blob: &EncryptedBlob, password: &str) -> Result<Vec<u8>, MakiError> {
-        if password.is_empty() {
-            return Err(MakiError::InvalidInput);
-        }
-        
-        let password_bytes = password.as_bytes();
-        let key = Self::derive_key(password_bytes, &blob.salt, blob.params)?;
-        let plaintext = Self::aes_gcm_decrypt(&key, &blob.nonce, &blob.ciphertext)?;
-        
-        // Zero out the key
-        // In production: use zeroize crate
-        
-        Ok(plaintext)
-    }
+    let key = derive_key_with_settings(password, &salt, settings)
+        .map_err(|_| MakiError::KeyDerivationFailed)?;
+    let header = build_header(settings, &salt, &nonce);
+    let metadata = authenticated_metadata(&header);
+    let encrypted_content = encrypt_with_key(secret, &key, &nonce, &metadata)
+        .map_err(|_| MakiError::EncryptionFailed)?;
+
+    let mut data = Vec::with_capacity(HEADER_LENGTH + encrypted_content.len());
+    data.extend_from_slice(&header);
+    data.extend_from_slice(&encrypted_content);
+
+    let encoded = Base64UrlUnpadded::encode_string(&data);
+    let mut encrypted_text = String::with_capacity(TEXT_PREFIX.len() + encoded.len());
+    encrypted_text.push_str(TEXT_PREFIX);
+    encrypted_text.push_str(&encoded);
+    Ok(encrypted_text)
 }
 
-// Simple base64 implementation (URL-safe, no padding)
-fn base64_encode(data: &[u8]) -> String {
-    const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    
-    let mut result = String::new();
-    let mut i = 0;
-    
-    while i + 2 < data.len() {
-        let b1 = data[i];
-        let b2 = data[i + 1];
-        let b3 = data[i + 2];
-        
-        result.push(CHARS[(b1 >> 2) as usize] as char);
-        result.push(CHARS[(((b1 & 0x03) << 4) | (b2 >> 4)) as usize] as char);
-        result.push(CHARS[(((b2 & 0x0f) << 2) | (b3 >> 6)) as usize] as char);
-        result.push(CHARS[(b3 & 0x3f) as usize] as char);
-        
-        i += 3;
+fn validate_protection_input(
+    secret: &[u8],
+    password: &[u8],
+    max_secret_size: usize,
+) -> Result<(), MakiError> {
+    maximum_text_length(max_secret_size)?;
+    if secret.is_empty() {
+        return Err(MakiError::EmptySecret);
     }
-    
-    // Handle remaining bytes
-    if i < data.len() {
-        let b1 = data[i];
-        result.push(CHARS[(b1 >> 2) as usize] as char);
-        
-        if i + 1 < data.len() {
-            let b2 = data[i + 1];
-            result.push(CHARS[(((b1 & 0x03) << 4) | (b2 >> 4)) as usize] as char);
-            result.push(CHARS[((b2 & 0x0f) << 2) as usize] as char);
-        } else {
-            result.push(CHARS[((b1 & 0x03) << 4) as usize] as char);
-        }
+    if password.is_empty() {
+        return Err(MakiError::EmptyPassword);
     }
-    
-    result
+    if secret.len() > max_secret_size {
+        return Err(MakiError::SecretTooLarge);
+    }
+    Ok(())
 }
 
-fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
-    let chars = s.as_bytes();
-    let mut result = Vec::new();
-    let mut i = 0;
-    
-    let decode_char = |c: u8| -> Option<u8> {
-        match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
-            b'-' => Some(62),
-            b'_' => Some(63),
-            _ => None,
-        }
+fn validate_settings(settings: Argon2Settings) -> Result<(), MakiError> {
+    settings_are_safe(settings)
+        .then_some(())
+        .ok_or(MakiError::UnsafeParameters)
+}
+
+fn build_header(
+    settings: Argon2Settings,
+    salt: &[u8; SALT_LENGTH],
+    nonce: &[u8; NONCE_LENGTH],
+) -> [u8; HEADER_LENGTH] {
+    // Permanent header layout, using big-endian integers:
+    // [memory:4][passes:4][lanes:4][salt:16][nonce:24]
+    let mut header = [0_u8; HEADER_LENGTH];
+    header[0..MEMORY_END].copy_from_slice(&settings.memory_kib.to_be_bytes());
+    header[MEMORY_END..PASSES_END].copy_from_slice(&settings.passes.to_be_bytes());
+    header[PASSES_END..LANES_END].copy_from_slice(&settings.lanes.to_be_bytes());
+    header[LANES_END..SALT_END].copy_from_slice(salt);
+    header[SALT_END..NONCE_END].copy_from_slice(nonce);
+    header
+}
+
+fn parse_settings(header: &[u8]) -> Result<Argon2Settings, MakiError> {
+    let memory_kib = u32::from_be_bytes(
+        header[0..MEMORY_END]
+            .try_into()
+            .map_err(|_| MakiError::InvalidText)?,
+    );
+    let passes = u32::from_be_bytes(
+        header[MEMORY_END..PASSES_END]
+            .try_into()
+            .map_err(|_| MakiError::InvalidText)?,
+    );
+    let lanes = u32::from_be_bytes(
+        header[PASSES_END..LANES_END]
+            .try_into()
+            .map_err(|_| MakiError::InvalidText)?,
+    );
+    Ok(Argon2Settings {
+        memory_kib,
+        passes,
+        lanes,
+    })
+}
+
+fn authenticated_metadata(header: &[u8]) -> Vec<u8> {
+    let mut metadata = Vec::with_capacity(TEXT_PREFIX.len() + header.len());
+    metadata.extend_from_slice(TEXT_PREFIX.as_bytes());
+    metadata.extend_from_slice(header);
+    metadata
+}
+
+fn maximum_text_length(max_secret_size: usize) -> Result<usize, MakiError> {
+    if max_secret_size == 0 {
+        return Err(MakiError::InvalidSecretLimit);
+    }
+
+    let maximum_data_length = HEADER_LENGTH
+        .checked_add(TAG_LENGTH)
+        .and_then(|length| length.checked_add(max_secret_size))
+        .ok_or(MakiError::InvalidSecretLimit)?;
+    if maximum_data_length > usize::MAX / 4 {
+        return Err(MakiError::InvalidSecretLimit);
+    }
+    let encoded_length =
+        base64_unpadded_length(maximum_data_length).ok_or(MakiError::InvalidSecretLimit)?;
+    TEXT_PREFIX
+        .len()
+        .checked_add(encoded_length)
+        .ok_or(MakiError::InvalidSecretLimit)
+}
+
+fn base64_unpadded_length(byte_length: usize) -> Option<usize> {
+    let full_groups = (byte_length / 3).checked_mul(4)?;
+    let remainder = match byte_length % 3 {
+        0 => 0,
+        1 => 2,
+        _ => 3,
     };
-    
-    while i + 3 < chars.len() {
-        let c1 = decode_char(chars[i]).ok_or(())?;
-        let c2 = decode_char(chars[i + 1]).ok_or(())?;
-        let c3 = decode_char(chars[i + 2]).ok_or(())?;
-        let c4 = decode_char(chars[i + 3]).ok_or(())?;
-        
-        result.push((c1 << 2) | (c2 >> 4));
-        result.push(((c2 & 0x0f) << 4) | (c3 >> 2));
-        result.push(((c3 & 0x03) << 6) | c4);
-        
-        i += 4;
-    }
-    
-    // Handle remaining chars
-    if i < chars.len() {
-        let c1 = decode_char(chars[i]).ok_or(())?;
-        if i + 1 < chars.len() {
-            let c2 = decode_char(chars[i + 1]).ok_or(())?;
-            result.push((c1 << 2) | (c2 >> 4));
-            
-            if i + 2 < chars.len() {
-                let c3 = decode_char(chars[i + 2]).ok_or(())?;
-                result.push(((c2 & 0x0f) << 4) | (c3 >> 2));
-            }
-        }
-    }
-    
-    Ok(result)
+    full_groups.checked_add(remainder)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use compiler_builtins::math::libm_math::support::int_traits::Int;
-    
+
     #[test]
-    fn test_argon2_params_pack_unpack() {
-        let params = Argon2Params::default();
-        let packed = params.pack();
-        let unpacked = Argon2Params::unpack(packed);
-        
-        // Due to precision loss in packing, we check approximate equality
-        assert!((unpacked.memory_kb - params.memory_kb).abs() < 1024);
-        assert_eq!(unpacked.iterations, params.iterations);
-        assert_eq!(unpacked.parallelism, params.parallelism);
+    fn operating_system_random_generation_succeeds() {
+        generate_salt().unwrap();
+        generate_nonce().unwrap();
     }
-    
+
     #[test]
-    fn test_blob_serialization() {
-        let params = Argon2Params::default();
-        let salt = [1u8; 16];
-        let nonce = [2u8; 12];
-        let ciphertext = vec![3u8; 32];
-        
-        let blob = EncryptedBlob::new(params, salt, nonce, ciphertext.clone());
-        let bytes = blob.to_bytes();
-        let decoded = EncryptedBlob::from_bytes(&bytes).unwrap();
-        
-        assert_eq!(decoded.version, blob.version);
-        assert_eq!(decoded.salt, blob.salt);
-        assert_eq!(decoded.nonce, blob.nonce);
-        assert_eq!(decoded.ciphertext, blob.ciphertext);
+    fn password_derived_key_encrypts_and_recovers_the_secret() {
+        let password = b"correct horse battery staple";
+        let secret =
+            b"abandon ability able about above absent absorb abstract absurd abuse access accident";
+        let salt = [0x2a; SALT_LENGTH];
+        let nonce = [0x7c; NONCE_LENGTH];
+        let metadata = b"maki authenticated metadata";
+        let settings = lightweight_test_settings();
+
+        let encryption_key = derive_key_with_settings(password, &salt, settings).unwrap();
+        let encrypted = encrypt_with_key(secret, &encryption_key, &nonce, metadata).unwrap();
+
+        let recovery_key = derive_key_with_settings(password, &salt, settings).unwrap();
+        let recovered = decrypt_with_key(&encrypted, &recovery_key, &nonce, metadata).unwrap();
+
+        assert_eq!(recovered.as_slice(), secret);
     }
-    
+
     #[test]
-    fn test_base64_roundtrip() {
-        let data = b"Hello, Maki!";
-        let encoded = base64_encode(data);
-        let decoded = base64_decode(&encoded).unwrap();
-        assert_eq!(data, &decoded[..]);
+    fn wrong_password_fails_authentication() {
+        let salt = [0x2a; SALT_LENGTH];
+        let nonce = [0x7c; NONCE_LENGTH];
+        let metadata = b"maki authenticated metadata";
+        let settings = lightweight_test_settings();
+        let encryption_key =
+            derive_key_with_settings(b"correct password", &salt, settings).unwrap();
+        let encrypted =
+            encrypt_with_key(b"test secret", &encryption_key, &nonce, metadata).unwrap();
+
+        let wrong_key = derive_key_with_settings(b"wrong password", &salt, settings).unwrap();
+
+        assert_authentication_fails(&encrypted, &wrong_key, &nonce, metadata);
     }
-    
+
     #[test]
-    fn test_encrypt_decrypt() {
-        let plaintext = b"test mnemonic phrase here";
-        let password = "strong_password_123";
-        
-        let blob = MakiCrypto::encrypt(plaintext, password).unwrap();
-        let decrypted = MakiCrypto::decrypt(&blob, password).unwrap();
-        
-        assert_eq!(plaintext, &decrypted[..]);
+    fn complete_workflow_protects_and_recovers_the_secret() {
+        let secret =
+            b"abandon ability able about above absent absorb abstract absurd abuse access accident";
+        let password = b"correct horse battery staple";
+        let encrypted_text = protect_test_secret(secret, password, DEFAULT_MAX_SECRET_SIZE);
+
+        let recovered = recover(&encrypted_text, password).unwrap();
+
+        assert_eq!(recovered.as_slice(), secret);
+        assert!(encrypted_text.starts_with(TEXT_PREFIX));
+        assert!(
+            encrypted_text[TEXT_PREFIX.len()..]
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        );
     }
-    
+
     #[test]
-    fn test_wrong_password_fails() {
-        let plaintext = b"test data";
-        let password = "correct_password";
-        let wrong_password = "wrong_password";
-        
-        let blob = MakiCrypto::encrypt(plaintext, password).unwrap();
-        let result = MakiCrypto::decrypt(&blob, wrong_password);
-        
-        assert!(matches!(result, Err(MakiError::InvalidPassword)));
+    fn complete_workflow_rejects_the_wrong_password() {
+        let encrypted_text =
+            protect_test_secret(b"test secret", b"correct password", DEFAULT_MAX_SECRET_SIZE);
+
+        assert_eq!(
+            recover(&encrypted_text, b"wrong password"),
+            Err(MakiError::AuthenticationFailed)
+        );
+    }
+
+    #[test]
+    fn custom_secret_limit_allows_a_larger_secret() {
+        let secret = vec![0x5a; DEFAULT_MAX_SECRET_SIZE + 1];
+        let custom_limit = secret.len();
+
+        assert_eq!(
+            protect_with_settings_and_material(
+                &secret,
+                b"password",
+                DEFAULT_MAX_SECRET_SIZE,
+                lightweight_test_settings(),
+                [0x2a; SALT_LENGTH],
+                [0x7c; NONCE_LENGTH],
+            ),
+            Err(MakiError::SecretTooLarge)
+        );
+
+        let encrypted_text = protect_test_secret(&secret, b"password", custom_limit);
+        assert_eq!(
+            recover(&encrypted_text, b"password"),
+            Err(MakiError::SecretTooLarge)
+        );
+
+        let recovered = recover_with_limit(&encrypted_text, b"password", custom_limit).unwrap();
+        assert_eq!(recovered.as_slice(), secret);
+    }
+
+    #[test]
+    fn arbitrary_binary_password_has_no_maki_size_limit() {
+        let password: Vec<u8> = (0..128 * 1024_usize)
+            .map(|index| (index.wrapping_mul(31) & 0xff) as u8)
+            .collect();
+        let encrypted_text =
+            protect_test_secret(b"test secret", &password, DEFAULT_MAX_SECRET_SIZE);
+
+        let recovered = recover(&encrypted_text, &password).unwrap();
+
+        assert_eq!(recovered.as_slice(), b"test secret");
+    }
+
+    #[test]
+    fn empty_inputs_are_rejected_before_cryptography() {
+        assert_eq!(protect(b"", b"password"), Err(MakiError::EmptySecret));
+        assert_eq!(protect(b"secret", b""), Err(MakiError::EmptyPassword));
+        assert_eq!(recover("", b"password"), Err(MakiError::InvalidText));
+        assert_eq!(recover("maki:", b"password"), Err(MakiError::InvalidText));
+        assert_eq!(
+            recover("maki:not+base64", b"password"),
+            Err(MakiError::InvalidText)
+        );
+        assert_eq!(recover("maki:AAAA", b""), Err(MakiError::EmptyPassword));
+    }
+
+    #[test]
+    fn complete_header_uses_the_agreed_layout() {
+        let settings = lightweight_test_settings();
+        let salt = [0x2a; SALT_LENGTH];
+        let nonce = [0x7c; NONCE_LENGTH];
+        let encrypted_text = protect_with_settings_and_material(
+            b"test secret",
+            b"password",
+            DEFAULT_MAX_SECRET_SIZE,
+            settings,
+            salt,
+            nonce,
+        )
+        .unwrap();
+        let decoded = decode_encrypted_text(&encrypted_text);
+
+        assert_eq!(&decoded[0..4], &settings.memory_kib.to_be_bytes());
+        assert_eq!(&decoded[4..8], &settings.passes.to_be_bytes());
+        assert_eq!(&decoded[8..12], &settings.lanes.to_be_bytes());
+        assert_eq!(&decoded[12..28], &salt);
+        assert_eq!(&decoded[28..52], &nonce);
+        assert_eq!(
+            decoded.len(),
+            HEADER_LENGTH + b"test secret".len() + TAG_LENGTH
+        );
+    }
+
+    #[test]
+    fn changing_the_authenticated_header_fails_recovery() {
+        let password = b"password";
+        let encrypted_text = protect_test_secret(b"test secret", password, DEFAULT_MAX_SECRET_SIZE);
+        let mut decoded = decode_encrypted_text(&encrypted_text);
+        decoded[12] ^= 1;
+        let changed_text = encode_encrypted_data(&decoded);
+
+        assert_eq!(
+            recover(&changed_text, password),
+            Err(MakiError::AuthenticationFailed)
+        );
+    }
+
+    #[test]
+    fn changing_the_encrypted_content_fails_recovery() {
+        let password = b"password";
+        let encrypted_text = protect_test_secret(b"test secret", password, DEFAULT_MAX_SECRET_SIZE);
+        let mut decoded = decode_encrypted_text(&encrypted_text);
+        let last = decoded.len() - 1;
+        decoded[last] ^= 1;
+        let changed_text = encode_encrypted_data(&decoded);
+
+        assert_eq!(
+            recover(&changed_text, password),
+            Err(MakiError::AuthenticationFailed)
+        );
+    }
+
+    #[test]
+    fn unsafe_parameters_are_rejected_before_key_derivation() {
+        let encrypted_text =
+            protect_test_secret(b"test secret", b"password", DEFAULT_MAX_SECRET_SIZE);
+        let mut decoded = decode_encrypted_text(&encrypted_text);
+        decoded[0..4].copy_from_slice(&(Argon2Settings::default().memory_kib + 1).to_be_bytes());
+        let changed_text = encode_encrypted_data(&decoded);
+
+        assert_eq!(
+            recover(&changed_text, b"password"),
+            Err(MakiError::UnsafeParameters)
+        );
+    }
+
+    #[test]
+    fn different_salt_and_nonce_produce_different_text() {
+        let first = protect_with_settings_and_material(
+            b"test secret",
+            b"password",
+            DEFAULT_MAX_SECRET_SIZE,
+            lightweight_test_settings(),
+            [1; SALT_LENGTH],
+            [2; NONCE_LENGTH],
+        )
+        .unwrap();
+        let second = protect_with_settings_and_material(
+            b"test secret",
+            b"password",
+            DEFAULT_MAX_SECRET_SIZE,
+            lightweight_test_settings(),
+            [3; SALT_LENGTH],
+            [4; NONCE_LENGTH],
+        )
+        .unwrap();
+
+        assert_ne!(first, second);
+    }
+
+    fn protect_test_secret(secret: &[u8], password: &[u8], max_secret_size: usize) -> String {
+        protect_with_settings_and_material(
+            secret,
+            password,
+            max_secret_size,
+            lightweight_test_settings(),
+            [0x2a; SALT_LENGTH],
+            [0x7c; NONCE_LENGTH],
+        )
+        .unwrap()
+    }
+
+    fn decode_encrypted_text(encrypted_text: &str) -> Vec<u8> {
+        Base64UrlUnpadded::decode_vec(
+            encrypted_text
+                .strip_prefix(TEXT_PREFIX)
+                .expect("Maki prefix"),
+        )
+        .unwrap()
+    }
+
+    fn encode_encrypted_data(data: &[u8]) -> String {
+        format!("{TEXT_PREFIX}{}", Base64UrlUnpadded::encode_string(data))
+    }
+
+    fn assert_authentication_fails(
+        encrypted_content: &[u8],
+        key: &[u8; KEY_LENGTH],
+        nonce: &[u8; NONCE_LENGTH],
+        metadata: &[u8],
+    ) {
+        assert_eq!(
+            decrypt_with_key(encrypted_content, key, nonce, metadata),
+            Err(EncryptionError::AuthenticationFailed)
+        );
+    }
+
+    fn lightweight_test_settings() -> Argon2Settings {
+        Argon2Settings {
+            memory_kib: 8 * 1024,
+            passes: 1,
+            lanes: 1,
+        }
     }
 }
